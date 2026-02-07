@@ -3,7 +3,7 @@ uv run python drifting.py \
     --data-root ./data/imagenette2-160 \
     --output-dir ./outputs/drifting_imagenette64_fix \
     --image-size 128 \
-    --batch-size 128 \
+    --batch-size 16 \
     --latent-dim 512 \
     --base-channels 128 \
     --lr 2e-4 \

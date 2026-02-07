@@ -249,9 +249,151 @@ def as_feature_list(feats: Tensor | Sequence[Tensor]) -> list[Tensor]:
     return list(feats)
 
 
+def _group_count(channels: int) -> int:
+    for g in (32, 16, 8, 4, 2):
+        if channels % g == 0:
+            return g
+    return 1
+
+
+def _apply_rope_1d(x: Tensor, pos: Tensor, base: float = 10000.0) -> Tensor:
+    """
+    Apply 1D rotary embedding over the last dimension of x.
+    x: [B, H, N, D], pos: [N], D must be even.
+    """
+    d = x.shape[-1]
+    if d < 2 or d % 2 != 0:
+        return x
+
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / float(d))
+    )
+    angles = pos.to(device=x.device, dtype=torch.float32)[:, None] * inv_freq[None, :]
+    cos = torch.cos(angles).to(dtype=x.dtype)[None, None, :, :]
+    sin = torch.sin(angles).to(dtype=x.dtype)[None, None, :, :]
+
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+    return torch.stack((out_even, out_odd), dim=-1).flatten(-2)
+
+
+def _apply_rope_2d(q: Tensor, k: Tensor, h: int, w: int, base: float = 10000.0) -> tuple[Tensor, Tensor]:
+    """
+    2D RoPE on q/k where last dim is split into y/x rotary subspaces.
+    q, k: [B, heads, N, D]
+    """
+    d = q.shape[-1]
+    rot_dim = (d // 4) * 4  # reserve a multiple of 4 dims for 2D rotary
+    if rot_dim == 0:
+        return q, k
+
+    half = rot_dim // 2
+    y_pos = torch.arange(h, device=q.device).repeat_interleave(w)
+    x_pos = torch.arange(w, device=q.device).repeat(h)
+
+    def apply_pair(t: Tensor) -> Tensor:
+        t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+        t_y, t_x = t_rot.split(half, dim=-1)
+        t_y = _apply_rope_1d(t_y, y_pos, base=base)
+        t_x = _apply_rope_1d(t_x, x_pos, base=base)
+        return torch.cat([t_y, t_x, t_pass], dim=-1)
+
+    return apply_pair(q), apply_pair(k)
+
+
+class SpatialAttention2d(nn.Module):
+    """
+    Global attention over full spatial tokens (BCHW -> BNC -> BCHW),
+    implemented with Linear projections + SDPA.
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4, rope_base: float = 10000.0):
+        super().__init__()
+        num_heads = max(1, min(int(num_heads), channels))
+        while channels % num_heads != 0 and num_heads > 1:
+            num_heads -= 1
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.rope_base = float(rope_base)
+
+        self.norm = nn.GroupNorm(_group_count(channels), channels)
+        self.to_qkv = nn.Linear(channels, channels * 3)
+        self.proj = nn.Linear(channels, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        b, c, h, w = x.shape
+
+        x_norm = self.norm(x)
+        n = h * w
+        tokens = x_norm.permute(0, 2, 3, 1).reshape(b, n, c)
+        q, k, v = self.to_qkv(tokens).chunk(3, dim=-1)
+
+        def reshape_heads(t: Tensor) -> Tensor:
+            return t.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = reshape_heads(q)
+        k = reshape_heads(k)
+        v = reshape_heads(v)
+        q, k = _apply_rope_2d(q, k, h, w, base=self.rope_base)
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(b, n, c)
+        out = self.proj(out)
+        out = out.view(b, h, w, c).permute(0, 3, 1, 2)
+        return residual + out
+
+
+class SwiGLU2d(nn.Module):
+    def __init__(self, channels: int, ff_mult: float = 2.0):
+        super().__init__()
+        hidden = int(channels * ff_mult)
+        self.norm = nn.GroupNorm(_group_count(channels), channels)
+        self.proj_in = nn.Linear(channels, hidden * 2)
+        self.proj_out = nn.Linear(hidden, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        b, c, h, w = x.shape
+        x = self.norm(x).permute(0, 2, 3, 1).reshape(b, h * w, c)
+        gate, val = self.proj_in(x).chunk(2, dim=-1)
+        x = F.silu(gate) * val
+        x = self.proj_out(x)
+        x = x.view(b, h, w, c).permute(0, 3, 1, 2)
+        return residual + x
+
+
+class ScaleRefineBlock(nn.Module):
+    """
+    One attention block + one SwiGLU block.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        ff_mult: float = 2.0,
+        rope_base: float = 10000.0,
+        use_attention: bool = True,
+    ):
+        super().__init__()
+        self.attn = (
+            SpatialAttention2d(channels, num_heads=4, rope_base=rope_base)
+            if use_attention
+            else nn.Identity()
+        )
+        self.ffn = SwiGLU2d(channels, ff_mult=ff_mult)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.attn(x)
+        x = self.ffn(x)
+        return x
+
+
 class ConvGenerator(nn.Module):
     """
-    Small upsampling generator: z -> image.
+    Upsampling generator with per-scale Attention + SwiGLU refinement.
     """
 
     def __init__(
@@ -277,26 +419,34 @@ class ConvGenerator(nn.Module):
         )
         self.start_channels = base_channels * min(8, 2**num_upsamples)
         self.project = nn.Linear(latent_dim, self.start_channels * 4 * 4)
-
-        layers: list[nn.Module] = []
+        self.stages = nn.ModuleList()
         channels = self.start_channels
         current_size = 4
         while current_size < image_size:
             next_channels = max(base_channels, channels // 2)
             groups = 8 if next_channels % 8 == 0 else 1
-            layers.extend(
-                [
+            is_last_upscale = (current_size * 2) == image_size
+            self.stages.append(
+                nn.Sequential(
                     nn.Upsample(scale_factor=2, mode="nearest"),
                     nn.Conv2d(channels, next_channels, kernel_size=3, padding=1),
                     nn.GroupNorm(groups, next_channels),
                     nn.SiLU(inplace=True),
-                ]
+                    ScaleRefineBlock(
+                        next_channels,
+                        ff_mult=2.0,
+                        rope_base=10000.0,
+                        use_attention=not is_last_upscale,
+                    ),
+                )
             )
             channels = next_channels
             current_size *= 2
 
-        layers.extend([nn.Conv2d(channels, out_channels, kernel_size=3, padding=1), nn.Tanh()])
-        self.net = nn.Sequential(*layers)
+        self.to_image = nn.Sequential(
+            nn.Conv2d(channels, out_channels, kernel_size=3, padding=1),
+            nn.Tanh(),
+        )
         self.apply(self._init_weights)
 
     @staticmethod
@@ -312,7 +462,9 @@ class ConvGenerator(nn.Module):
                 raise ValueError("labels are required when class conditioning is enabled.")
             z = z + self.class_embed(labels)
         h = self.project(z).view(z.shape[0], self.start_channels, 4, 4)
-        return self.net(h)
+        for stage in self.stages:
+            h = stage(h)
+        return self.to_image(h)
 
     @torch.no_grad()
     def generate(
