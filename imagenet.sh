@@ -1,0 +1,19 @@
+uv run python drifting.py \
+    --dataset imagenet \
+    --data-root ./data/imagenette2-160 \
+    --output-dir ./outputs/drifting_imagenette64_fix \
+    --image-size 64 \
+    --batch-size 64 \
+    --latent-dim 256 \
+    --base-channels 128 \
+    --lr 1e-4 \
+    --pixel-drift-weight 0.3 \
+    --num-workers 0 \
+    --class-conditioning \
+    --feature-backbone resnet18 \
+    --temperatures 0.02 0.05 0.2 \
+    --drift-norm-mode ema \
+    --epochs 50 \
+    --log-every 50 \
+    --sample-every 1000 \
+    --checkpoint-every 5000
