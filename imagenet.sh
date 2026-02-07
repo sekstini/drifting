@@ -1,22 +1,19 @@
 uv run python drifting.py \
     --dataset imagenet \
     --data-root ./data/imagenette2-160 \
-    --output-dir ./outputs/drifting_imagenette64_fix \
-    --image-size 128 \
-    --batch-size 16 \
-    --latent-dim 512 \
-    --base-channels 128 \
+    --output-dir ./outputs/drifting_imagenette64_core \
+    --image-size 64 \
+    --batch-size 32 \
+    --latent-dim 256 \
+    --base-channels 96 \
     --lr 2e-4 \
-    --weight-decay 0.1 \
-    --pixel-drift-weight 0.3 \
-    --num-workers 6 \
+    --weight-decay 0.01 \
     --class-conditioning \
     --feature-backbone resnet18 \
     --temperatures 0.02 0.05 0.2 \
-    --drift-norm-mode batch \
     --epochs 50 \
     --log-every 50 \
-    --sample-every 50 \
+    --sample-every 100 \
     --sample-count 40 \
     --sample-nrow 10 \
-    --checkpoint-every 5000
+    --checkpoint-every 2000

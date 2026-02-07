@@ -3,21 +3,17 @@
 Drifting Models for Image Generation
 ====================================
 
-A practical image-generation script based on "Generative Modeling via Drifting"
-(arXiv:2602.04770). This keeps the same core training recipe as the reference:
+A practical image-generation script following the core training algorithm from
+"Generative Modeling via Drifting" (arXiv:2602.04770) and the local
+`drifting_ref.py` reference:
 
   loss = || f(eps) - stopgrad(f(eps) + V) ||^2
 
-where V is computed by a kernelized drifting field using positive (data) and
-negative (generated) samples.
+where V is computed with the doubly-normalized kernelized drifting field.
 
 Supported datasets:
 - FashionMNIST (auto-download)
-- ImageNet (either torchvision ImageNet layout or ImageFolder train/ layout)
-
-Examples:
-  python drifting.py --dataset fashionmnist --data-root ./data --epochs 5
-  python drifting.py --dataset imagenet --data-root /path/to/imagenet --image-size 64
+- ImageNet-style folder (ImageFolder at <data-root>/train/*)
 """
 
 from __future__ import annotations
@@ -44,7 +40,6 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-import torchinfo
 from rich.table import Table
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
@@ -54,8 +49,13 @@ from torchvision.transforms import InterpolationMode
 from torchvision.utils import make_grid, save_image
 
 try:
+    import torchinfo
+except Exception:  # pragma: no cover
+    torchinfo = None
+
+try:
     from torchvision.models import ResNet18_Weights
-except Exception:  # pragma: no cover - old torchvision fallback
+except Exception:  # pragma: no cover
     ResNet18_Weights = None
 
 
@@ -98,25 +98,21 @@ def compute_drift(
     eps: float = 1e-12,
 ) -> Tensor:
     """
-    Compute V(x) with the doubly-normalized affinities from the paper appendix.
+    Algorithm 2 style compute_V with doubly-normalized affinities.
     """
     n, n_pos = x.shape[0], y_pos.shape[0]
 
     dist_pos = torch.cdist(x, y_pos)
     dist_neg = torch.cdist(x, y_neg)
 
-    # Paper Algorithm 2 masks self negatives when y_neg is the generated batch itself.
     if mask_self_negatives:
         if n != y_neg.shape[0]:
-            raise ValueError(
-                "mask_self_negatives=True requires x and y_neg to have same batch size."
-            )
+            raise ValueError("mask_self_negatives=True requires x and y_neg to have same batch size.")
         dist_neg = dist_neg + torch.eye(n, device=x.device, dtype=x.dtype) * 1e6
 
     logit = torch.cat([-dist_pos / temp, -dist_neg / temp], dim=1)
-
-    a_row = logit.softmax(dim=-1)  # normalization over y
-    a_col = logit.softmax(dim=-2)  # extra normalization over x
+    a_row = logit.softmax(dim=-1)
+    a_col = logit.softmax(dim=-2)
     a = torch.sqrt((a_row * a_col).clamp_min(eps))
 
     a_pos = a[:, :n_pos]
@@ -135,7 +131,7 @@ def normalize_feature_space(
     eps: float = 1e-6,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """
-    Feature normalization from appendix: average pairwise distance ~ sqrt(C).
+    Appendix feature normalization: average pairwise distance ~ sqrt(C).
     """
     c = x_feat.shape[-1]
     with torch.no_grad():
@@ -149,26 +145,19 @@ def compute_feature_drift(
     x_feat: Tensor,
     pos_feat: Tensor,
     temperatures: Sequence[float],
-    *,
-    norm_mode: str = "batch",
-    ema_state: dict[str, float] | None = None,
-    ema_prefix: str = "main",
-    ema_decay: float = 0.99,
     eps: float = 1e-6,
 ) -> tuple[Tensor, float, float]:
     """
-    Compute aggregated feature-space drift with optional multi-temperature setup.
-
-    Returns:
-      total_drift, raw_drift_sq, normed_drift_sq
+    Compute normalized drift in feature space with multi-temperature aggregation.
     """
-    x_norm, pos_norm, neg_norm = normalize_feature_space(x_feat, pos_feat, x_feat, eps)
+    x_norm, pos_norm, neg_norm = normalize_feature_space(x_feat, pos_feat, x_feat, eps=eps)
     c = x_feat.shape[-1]
     temp_scale = math.sqrt(float(c))
 
     total = torch.zeros_like(x_norm)
     raw_vals: list[float] = []
     norm_vals: list[float] = []
+
     for tau in temperatures:
         tau_eff = max(float(tau), eps) * temp_scale
         v = compute_drift(
@@ -177,81 +166,46 @@ def compute_feature_drift(
             neg_norm,
             temp=tau_eff,
             mask_self_negatives=True,
+            eps=eps,
         )
 
         with torch.no_grad():
             raw_sq = v.pow(2).sum(dim=-1).mean()
-            raw_vals.append(raw_sq.item())
-            base = raw_sq / float(c)
-            if norm_mode == "batch":
-                lam_sq = base
-            elif norm_mode == "ema":
-                if ema_state is None:
-                    raise ValueError("ema_state must be provided when norm_mode='ema'.")
-                key = f"{ema_prefix}|c={c}|tau={float(tau):g}"
-                prev = ema_state.get(key)
-                if prev is None:
-                    ema_val = base.item()
-                else:
-                    ema_val = float(ema_decay) * prev + (1.0 - float(ema_decay)) * base.item()
-                ema_state[key] = ema_val
-                lam_sq = torch.tensor(ema_val, device=v.device, dtype=v.dtype)
-            else:
-                raise ValueError(f"Unsupported norm_mode: {norm_mode}")
-            lam = torch.sqrt(lam_sq.clamp_min(eps))
+            lam_sq = (raw_sq / float(c)).clamp_min(eps)
+            lam = torch.sqrt(lam_sq)
 
         v_norm = v / lam
-        with torch.no_grad():
-            norm_vals.append(v_norm.pow(2).sum(dim=-1).mean().item())
         total = total + v_norm
+
+        with torch.no_grad():
+            raw_vals.append(raw_sq.item())
+            norm_vals.append(v_norm.pow(2).sum(dim=-1).mean().item())
+
     raw_drift_sq = sum(raw_vals) / max(1, len(raw_vals))
-    normed_drift_sq = sum(norm_vals) / max(1, len(norm_vals))
-    return total, raw_drift_sq, normed_drift_sq
+    norm_drift_sq = sum(norm_vals) / max(1, len(norm_vals))
+    return total, raw_drift_sq, norm_drift_sq
 
 
 def drifting_loss_from_features(
     fake_feat: Tensor,
     real_feat: Tensor,
     temperatures: Sequence[float],
-    *,
-    norm_mode: str,
-    ema_state: dict[str, float],
-    ema_prefix: str,
-    ema_decay: float,
     eps: float = 1e-6,
 ) -> tuple[Tensor, float, float]:
     """
-    stopgrad( fake_feat + V ) target, gradients only through fake_feat.
+    stopgrad(fake + V) target as in Algorithm 1.
     """
     with torch.no_grad():
-        drift, raw_drift_sq, normed_drift_sq = compute_feature_drift(
+        drift, raw_drift_sq, norm_drift_sq = compute_feature_drift(
             fake_feat.detach(),
             real_feat.detach(),
             temperatures,
-            norm_mode=norm_mode,
-            ema_state=ema_state,
-            ema_prefix=ema_prefix,
-            ema_decay=ema_decay,
             eps=eps,
         )
         target = (fake_feat + drift).detach()
 
     loss_per_sample = (fake_feat - target).pow(2).mean(dim=-1)
-    return loss_per_sample, raw_drift_sq, normed_drift_sq
-
-
-def feature_moment_gap(fake_feat: Tensor, real_feat: Tensor) -> float:
-    """
-    Distribution mismatch proxy in feature space (independent of drift normalization).
-    """
-    with torch.no_grad():
-        fake_mean = fake_feat.mean(dim=0)
-        real_mean = real_feat.mean(dim=0)
-        fake_std = fake_feat.std(dim=0, unbiased=False)
-        real_std = real_feat.std(dim=0, unbiased=False)
-        mean_mse = F.mse_loss(fake_mean, real_mean)
-        std_mse = F.mse_loss(fake_std, real_std)
-    return (mean_mse + std_mse).item()
+    return loss_per_sample, raw_drift_sq, norm_drift_sq
 
 
 def as_feature_list(feats: Tensor | Sequence[Tensor]) -> list[Tensor]:
@@ -260,151 +214,9 @@ def as_feature_list(feats: Tensor | Sequence[Tensor]) -> list[Tensor]:
     return list(feats)
 
 
-def _group_count(channels: int) -> int:
-    for g in (32, 16, 8, 4, 2):
-        if channels % g == 0:
-            return g
-    return 1
-
-
-def _apply_rope_1d(x: Tensor, pos: Tensor, base: float = 10000.0) -> Tensor:
-    """
-    Apply 1D rotary embedding over the last dimension of x.
-    x: [B, H, N, D], pos: [N], D must be even.
-    """
-    d = x.shape[-1]
-    if d < 2 or d % 2 != 0:
-        return x
-
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / float(d))
-    )
-    angles = pos.to(device=x.device, dtype=torch.float32)[:, None] * inv_freq[None, :]
-    cos = torch.cos(angles).to(dtype=x.dtype)[None, None, :, :]
-    sin = torch.sin(angles).to(dtype=x.dtype)[None, None, :, :]
-
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    out_even = x_even * cos - x_odd * sin
-    out_odd = x_even * sin + x_odd * cos
-    return torch.stack((out_even, out_odd), dim=-1).flatten(-2)
-
-
-def _apply_rope_2d(q: Tensor, k: Tensor, h: int, w: int, base: float = 10000.0) -> tuple[Tensor, Tensor]:
-    """
-    2D RoPE on q/k where last dim is split into y/x rotary subspaces.
-    q, k: [B, heads, N, D]
-    """
-    d = q.shape[-1]
-    rot_dim = (d // 4) * 4  # reserve a multiple of 4 dims for 2D rotary
-    if rot_dim == 0:
-        return q, k
-
-    half = rot_dim // 2
-    y_pos = torch.arange(h, device=q.device).repeat_interleave(w)
-    x_pos = torch.arange(w, device=q.device).repeat(h)
-
-    def apply_pair(t: Tensor) -> Tensor:
-        t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-        t_y, t_x = t_rot.split(half, dim=-1)
-        t_y = _apply_rope_1d(t_y, y_pos, base=base)
-        t_x = _apply_rope_1d(t_x, x_pos, base=base)
-        return torch.cat([t_y, t_x, t_pass], dim=-1)
-
-    return apply_pair(q), apply_pair(k)
-
-
-class SpatialAttention2d(nn.Module):
-    """
-    Global attention over full spatial tokens (BCHW -> BNC -> BCHW),
-    implemented with Linear projections + SDPA.
-    """
-
-    def __init__(self, channels: int, num_heads: int = 4, rope_base: float = 10000.0):
-        super().__init__()
-        num_heads = max(1, min(int(num_heads), channels))
-        while channels % num_heads != 0 and num_heads > 1:
-            num_heads -= 1
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.rope_base = float(rope_base)
-
-        self.norm = nn.GroupNorm(_group_count(channels), channels)
-        self.to_qkv = nn.Linear(channels, channels * 3)
-        self.proj = nn.Linear(channels, channels)
-
-    def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        b, c, h, w = x.shape
-
-        x_norm = self.norm(x)
-        n = h * w
-        tokens = x_norm.permute(0, 2, 3, 1).reshape(b, n, c)
-        q, k, v = self.to_qkv(tokens).chunk(3, dim=-1)
-
-        def reshape_heads(t: Tensor) -> Tensor:
-            return t.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q = reshape_heads(q)
-        k = reshape_heads(k)
-        v = reshape_heads(v)
-        q, k = _apply_rope_2d(q, k, h, w, base=self.rope_base)
-
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        out = out.transpose(1, 2).reshape(b, n, c)
-        out = self.proj(out)
-        out = out.view(b, h, w, c).permute(0, 3, 1, 2)
-        return residual + out
-
-
-class SwiGLU2d(nn.Module):
-    def __init__(self, channels: int, ff_mult: float = 2.0):
-        super().__init__()
-        hidden = int(channels * ff_mult)
-        self.norm = nn.GroupNorm(_group_count(channels), channels)
-        self.proj_in = nn.Linear(channels, hidden * 2)
-        self.proj_out = nn.Linear(hidden, channels)
-
-    def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        b, c, h, w = x.shape
-        x = self.norm(x).permute(0, 2, 3, 1).reshape(b, h * w, c)
-        gate, val = self.proj_in(x).chunk(2, dim=-1)
-        x = F.silu(gate) * val
-        x = self.proj_out(x)
-        x = x.view(b, h, w, c).permute(0, 3, 1, 2)
-        return residual + x
-
-
-class ScaleRefineBlock(nn.Module):
-    """
-    One attention block + one SwiGLU block.
-    """
-
-    def __init__(
-        self,
-        channels: int,
-        ff_mult: float = 2.0,
-        rope_base: float = 10000.0,
-        use_attention: bool = True,
-    ):
-        super().__init__()
-        self.attn = (
-            SpatialAttention2d(channels, num_heads=4, rope_base=rope_base)
-            if use_attention
-            else nn.Identity()
-        )
-        self.ffn = SwiGLU2d(channels, ff_mult=ff_mult)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.attn(x)
-        x = self.ffn(x)
-        return x
-
-
 class ConvGenerator(nn.Module):
     """
-    Upsampling generator with per-scale Attention + SwiGLU refinement.
+    Simple upsampling conv generator (kept intentionally minimal).
     """
 
     def __init__(
@@ -425,30 +237,27 @@ class ConvGenerator(nn.Module):
 
         self.latent_dim = latent_dim
         self.num_classes = max(0, int(num_classes))
-        self.class_embed = (
-            nn.Embedding(self.num_classes, latent_dim) if self.num_classes > 0 else None
-        )
+        self.class_embed = nn.Embedding(self.num_classes, latent_dim) if self.num_classes > 0 else None
+        cond_dim = latent_dim + (latent_dim if self.num_classes > 0 else 0)
+
         self.start_channels = base_channels * min(8, 2**num_upsamples)
-        self.project = nn.Linear(latent_dim, self.start_channels * 4 * 4)
+        self.project = nn.Linear(cond_dim, self.start_channels * 4 * 4)
+
         self.stages = nn.ModuleList()
         channels = self.start_channels
         current_size = 4
         while current_size < image_size:
             next_channels = max(base_channels, channels // 2)
             groups = 8 if next_channels % 8 == 0 else 1
-            is_last_upscale = (current_size * 2) == image_size
             self.stages.append(
                 nn.Sequential(
                     nn.Upsample(scale_factor=2, mode="nearest"),
                     nn.Conv2d(channels, next_channels, kernel_size=3, padding=1),
                     nn.GroupNorm(groups, next_channels),
                     nn.SiLU(inplace=True),
-                    ScaleRefineBlock(
-                        next_channels,
-                        ff_mult=2.0,
-                        rope_base=10000.0,
-                        use_attention=not is_last_upscale,
-                    ),
+                    nn.Conv2d(next_channels, next_channels, kernel_size=3, padding=1),
+                    nn.GroupNorm(groups, next_channels),
+                    nn.SiLU(inplace=True),
                 )
             )
             channels = next_channels
@@ -462,7 +271,7 @@ class ConvGenerator(nn.Module):
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -471,72 +280,50 @@ class ConvGenerator(nn.Module):
         if self.class_embed is not None:
             if labels is None:
                 raise ValueError("labels are required when class conditioning is enabled.")
-            z = z + self.class_embed(labels)
-        h = self.project(z).view(z.shape[0], self.start_channels, 4, 4)
+            cond = torch.cat([z, self.class_embed(labels)], dim=-1)
+        else:
+            cond = z
+
+        h = self.project(cond).view(cond.shape[0], self.start_channels, 4, 4)
         for stage in self.stages:
             h = stage(h)
         return self.to_image(h)
 
     @torch.no_grad()
-    def generate(
-        self, n: int, device: torch.device, labels: Tensor | None = None
-    ) -> Tensor:
+    def generate(self, n: int, device: torch.device, labels: Tensor | None = None) -> Tensor:
         z = torch.randn(n, self.latent_dim, device=device)
         return self(z, labels=labels)
 
 
 class PyramidFeatureExtractor(nn.Module):
     """
-    Lightweight fixed feature extractor:
-    - multi-scale pooled intensities
-    - local contrast map
+    Lightweight multi-scale feature extractor for small/fast runs.
+    Returns list of [B, T, C] features.
     """
 
-    def __init__(self, pool_sizes: Sequence[int] = (16, 8, 4), contrast_size: int = 8):
+    def __init__(self, pool_sizes: Sequence[int] = (8, 4, 2, 1)):
         super().__init__()
         self.pool_sizes = tuple(pool_sizes)
-        self.contrast_size = contrast_size
 
-    def forward(self, x: Tensor) -> Tensor:
-        feats = []
+    def forward(self, x: Tensor) -> list[Tensor]:
+        feats: list[Tensor] = []
+        b = x.shape[0]
         for size in self.pool_sizes:
             pooled = F.adaptive_avg_pool2d(x, output_size=(size, size))
-            feats.append(pooled.flatten(start_dim=1))
-
-        local_contrast = x - F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-        contrast = F.adaptive_avg_pool2d(
-            local_contrast, output_size=(self.contrast_size, self.contrast_size)
-        )
-        feats.append(contrast.flatten(start_dim=1))
-
-        return torch.cat(feats, dim=1)
-
-
-class PixelFeatureExtractor(nn.Module):
-    """
-    Pixel-space features to anchor fine detail and reduce feature-space shortcuts.
-    """
-
-    def __init__(self, size: int = 16):
-        super().__init__()
-        self.size = size
-
-    def forward(self, x: Tensor) -> Tensor:
-        if self.size > 0:
-            x = F.interpolate(
-                x, size=(self.size, self.size), mode="bilinear", align_corners=False
-            )
-        return x.flatten(start_dim=1)
+            feats.append(pooled.permute(0, 2, 3, 1).reshape(b, size * size, pooled.shape[1]))
+        return feats
 
 
 class ResNet18FeatureExtractor(nn.Module):
     """
-    Frozen ResNet18 feature encoder for drift loss.
+    Frozen ResNet18 multi-scale feature encoder.
+    Returns list of [B, T, C] features.
     """
 
-    def __init__(self, pretrained: bool = True, multi_scale: bool = True):
+    def __init__(self, pretrained: bool = True, pool_sizes: Sequence[int] = (8, 4, 2, 1)):
         super().__init__()
-        self.multi_scale = multi_scale
+        self.pool_sizes = tuple(pool_sizes)
+
         weights = None
         if pretrained and ResNet18_Weights is not None:
             weights = ResNet18_Weights.DEFAULT
@@ -545,10 +332,7 @@ class ResNet18FeatureExtractor(nn.Module):
             model = resnet18(weights=weights)
         except Exception as exc:
             if pretrained:
-                LOGGER.warning(
-                    "Could not load pretrained ResNet18 (%s). Falling back to random init.",
-                    exc,
-                )
+                LOGGER.warning("Could not load pretrained ResNet18 (%s). Falling back to random init.", exc)
             model = resnet18(weights=None)
 
         self.conv1 = model.conv1
@@ -568,7 +352,7 @@ class ResNet18FeatureExtractor(nn.Module):
         super().train(False)
         return self
 
-    def forward(self, x: Tensor) -> Tensor | list[Tensor]:
+    def forward(self, x: Tensor) -> list[Tensor]:
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
         if x.shape[-1] < 64:
@@ -582,19 +366,15 @@ class ResNet18FeatureExtractor(nn.Module):
         f3 = self.layer3(f2)
         f4 = self.layer4(f3)
 
-        feats = []
-        for f in (f1, f2, f3, f4):
-            pooled = F.adaptive_avg_pool2d(f, output_size=(1, 1)).flatten(start_dim=1)
-            feats.append(F.normalize(pooled, dim=-1))
-
-        if self.multi_scale:
-            return feats
-        return feats[-1]
+        feats: list[Tensor] = []
+        for f, size in zip((f1, f2, f3, f4), self.pool_sizes):
+            pooled = F.adaptive_avg_pool2d(f, output_size=(size, size))
+            b, c, h, w = pooled.shape
+            feats.append(pooled.permute(0, 2, 3, 1).reshape(b, h * w, c))
+        return feats
 
 
-def build_feature_extractor(
-    name: str, dataset_name: str, use_pretrained: bool
-) -> tuple[nn.Module, str]:
+def build_feature_extractor(name: str, dataset_name: str, use_pretrained: bool) -> tuple[nn.Module, str]:
     resolved = name
     if name == "auto":
         resolved = "pyramid" if dataset_name == "fashionmnist" else "resnet18"
@@ -602,7 +382,7 @@ def build_feature_extractor(
     if resolved == "pyramid":
         return PyramidFeatureExtractor(), resolved
     if resolved == "resnet18":
-        return ResNet18FeatureExtractor(pretrained=use_pretrained, multi_scale=True), resolved
+        return ResNet18FeatureExtractor(pretrained=use_pretrained), resolved
     raise ValueError(f"Unsupported feature extractor: {name}")
 
 
@@ -620,25 +400,29 @@ def image_transform(dataset_name: str, image_size: int) -> transforms.Compose:
         return transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    image_size, scale=(0.6, 1.0), interpolation=InterpolationMode.BICUBIC, antialias=True
+                    image_size,
+                    scale=(0.6, 1.0),
+                    interpolation=InterpolationMode.BICUBIC,
+                    antialias=True,
                 ),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ]
         )
+
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def build_dataset(
-    dataset_name: str, data_root: Path, image_size: int
+    dataset_name: str,
+    data_root: Path,
+    image_size: int,
 ) -> tuple[torch.utils.data.Dataset, int, int]:
     transform = image_transform(dataset_name, image_size)
 
     if dataset_name == "fashionmnist":
-        ds = datasets.FashionMNIST(
-            root=str(data_root), train=True, transform=transform, download=True
-        )
+        ds = datasets.FashionMNIST(root=str(data_root), train=True, transform=transform, download=True)
         return ds, 1, len(ds.classes)
 
     if dataset_name == "imagenet":
@@ -653,9 +437,8 @@ def build_dataset(
             return ds, 3, classes
         except Exception as exc:
             raise RuntimeError(
-                "ImageNet path not found. Use --data-root that either contains "
-                "'train/<class_name>/*' (ImageFolder) or official torchvision "
-                "ImageNet metadata layout."
+                "ImageNet path not found. Use --data-root containing either "
+                "'train/<class_name>/*' (ImageFolder) or official torchvision ImageNet metadata layout."
             ) from exc
 
     raise ValueError(f"Unsupported dataset: {dataset_name}")
@@ -739,7 +522,7 @@ def render_config_table(
     device: torch.device,
     run_dir: Path,
 ) -> None:
-    table = Table(title="Drifting Image Training")
+    table = Table(title="Drifting Image Training (Paper-Core)")
     table.add_column("Key", style="cyan")
     table.add_column("Value", style="magenta")
     table.add_row("dataset", args.dataset)
@@ -753,13 +536,9 @@ def render_config_table(
     table.add_row("steps_per_epoch", str(args.steps_per_epoch if args.steps_per_epoch > 0 else "full"))
     table.add_row("max_steps", str(args.max_steps if args.max_steps > 0 else "none"))
     table.add_row("latent_dim", str(args.latent_dim))
-    table.add_row("sample_seed", str(args.sample_seed))
     table.add_row("feature_extractor", feature_name)
-    table.add_row("drift_norm_mode", args.drift_norm_mode)
-    table.add_row("drift_ema_decay", f"{args.drift_ema_decay:g}")
-    table.add_row("pixel_drift_weight", f"{args.pixel_drift_weight:g}")
-    table.add_row("pixel_drift_size", str(args.pixel_drift_size))
     table.add_row("temperatures", ",".join(f"{t:g}" for t in args.temperatures))
+    table.add_row("optimizer", "AdamW(beta1=0.9,beta2=0.95)")
     table.add_row("device", str(device))
     table.add_row("run_dir", str(run_dir))
     console.print(table)
@@ -785,7 +564,9 @@ def train(args: argparse.Namespace) -> None:
     cond_num_classes = num_classes if args.class_conditioning else 0
 
     feature_extractor, feature_name = build_feature_extractor(
-        args.feature_backbone, args.dataset, args.pretrained_features
+        args.feature_backbone,
+        args.dataset,
+        args.pretrained_features,
     )
     feature_extractor = feature_extractor.to(device)
     feature_extractor.eval()
@@ -799,24 +580,23 @@ def train(args: argparse.Namespace) -> None:
         base_channels=args.base_channels,
         num_classes=cond_num_classes,
     ).to(device)
-    pixel_feature_extractor = PixelFeatureExtractor(size=args.pixel_drift_size).to(device)
 
-    console.print(torchinfo.summary(generator, verbose=0))
+    if torchinfo is not None:
+        console.print(torchinfo.summary(generator, verbose=0))
 
     optimizer = torch.optim.AdamW(
         generator.parameters(),
         lr=args.lr,
-        betas=(0.9, 0.9),
+        betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
     )
-    drift_ema_state: dict[str, float] = {}
+
     sample_noise_generator = torch.Generator(device="cpu")
     sample_noise_generator.manual_seed(args.sample_seed)
-    fixed_sample_z = torch.randn(
-        args.sample_count, args.latent_dim, generator=sample_noise_generator
-    )
+    fixed_sample_z = torch.randn(args.sample_count, args.latent_dim, generator=sample_noise_generator)
     if device.type != "cpu":
         fixed_sample_z = fixed_sample_z.to(device)
+
     fixed_sample_labels = None
     if cond_num_classes > 0:
         fixed_sample_labels = torch.arange(args.sample_count, dtype=torch.long) % cond_num_classes
@@ -831,13 +611,9 @@ def train(args: argparse.Namespace) -> None:
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         LOGGER.info("Resumed from %s at step=%d epoch=%d", args.resume, global_step, start_epoch)
 
-    render_config_table(
-        console, args, len(dataset), num_classes, feature_name, device, run_dir
-    )
+    render_config_table(console, args, len(dataset), num_classes, feature_name, device, run_dir)
 
-    steps_per_epoch = (
-        len(loader) if args.steps_per_epoch <= 0 else min(args.steps_per_epoch, len(loader))
-    )
+    steps_per_epoch = len(loader) if args.steps_per_epoch <= 0 else min(args.steps_per_epoch, len(loader))
     max_steps = args.max_steps if args.max_steps > 0 else None
 
     progress = Progress(
@@ -847,9 +623,8 @@ def train(args: argparse.Namespace) -> None:
         MofNCompleteColumn(),
         TaskProgressColumn(),
         TextColumn("loss={task.fields[loss]:.5f}"),
-        TextColumn("gap={task.fields[gap]:.5f}"),
-        TextColumn("raw={task.fields[raw_drift]:.2f}"),
-        TextColumn("norm={task.fields[norm_drift]:.2f}"),
+        TextColumn("raw={task.fields[raw_drift]:.3f}"),
+        TextColumn("norm={task.fields[norm_drift]:.3f}"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
         console=console,
@@ -859,46 +634,41 @@ def train(args: argparse.Namespace) -> None:
     def compute_feature_set_loss(
         fake_feat_set: Sequence[Tensor],
         real_feat_set: Sequence[Tensor],
-        prefix: str,
-    ) -> tuple[Tensor, float, float, float]:
+    ) -> tuple[Tensor, float, float]:
         if len(fake_feat_set) != len(real_feat_set):
             raise RuntimeError(
                 f"Feature extractor mismatch: {len(fake_feat_set)} fake branches vs "
                 f"{len(real_feat_set)} real branches."
             )
+
         loss_sum: Tensor | None = None
         raw_sum = 0.0
         norm_sum = 0.0
-        gap_sum = 0.0
-        for branch_idx, (fake_feat, real_feat) in enumerate(zip(fake_feat_set, real_feat_set)):
+
+        for fake_feat, real_feat in zip(fake_feat_set, real_feat_set):
+            fake_flat = fake_feat.reshape(-1, fake_feat.shape[-1])
+            real_flat = real_feat.reshape(-1, real_feat.shape[-1])
+
             loss_per_sample, raw_drift_sq, norm_drift_sq = drifting_loss_from_features(
-                fake_feat,
-                real_feat,
+                fake_flat,
+                real_flat,
                 args.temperatures,
-                norm_mode=args.drift_norm_mode,
-                ema_state=drift_ema_state,
-                ema_prefix=f"{prefix}/{branch_idx}",
-                ema_decay=args.drift_ema_decay,
                 eps=args.eps,
             )
             branch_loss = loss_per_sample.mean()
             loss_sum = branch_loss if loss_sum is None else loss_sum + branch_loss
             raw_sum += raw_drift_sq
             norm_sum += norm_drift_sq
-            gap_sum += feature_moment_gap(fake_feat.detach(), real_feat.detach())
 
         if loss_sum is None:
             raise RuntimeError("No feature branches available for loss computation.")
-        branch_count = float(max(1, len(fake_feat_set)))
-        return (
-            loss_sum / branch_count,
-            raw_sum / branch_count,
-            norm_sum / branch_count,
-            gap_sum / branch_count,
-        )
+
+        count = float(max(1, len(fake_feat_set)))
+        return loss_sum / count, raw_sum / count, norm_sum / count
 
     generator.train()
     last_epoch = start_epoch - 1
+
     with progress:
         for epoch in range(start_epoch, args.epochs + 1):
             last_epoch = epoch
@@ -906,13 +676,11 @@ def train(args: argparse.Namespace) -> None:
                 f"Epoch {epoch}/{args.epochs}",
                 total=steps_per_epoch,
                 loss=0.0,
-                gap=0.0,
                 raw_drift=0.0,
                 norm_drift=0.0,
             )
 
             running_loss = 0.0
-            running_gap = 0.0
             running_raw_drift = 0.0
             running_norm_drift = 0.0
             seen = 0
@@ -925,13 +693,13 @@ def train(args: argparse.Namespace) -> None:
 
                 real, labels = unpack_batch(batch)
                 real = real.to(device, non_blocking=(device.type == "cuda"))
+
                 labels_t = None
                 if cond_num_classes > 0:
                     if labels is None:
-                        raise RuntimeError(
-                            "class conditioning is enabled but this dataset does not provide labels."
-                        )
+                        raise RuntimeError("class conditioning enabled but dataset does not provide labels")
                     labels_t = labels.to(device, dtype=torch.long, non_blocking=(device.type == "cuda"))
+
                 z = torch.randn(real.shape[0], args.latent_dim, device=device)
                 fake = generator(z, labels=labels_t)
 
@@ -939,19 +707,10 @@ def train(args: argparse.Namespace) -> None:
                 with torch.no_grad():
                     real_feats = as_feature_list(feature_extractor(real))
 
-                pixel_fake_feat = None
-                pixel_real_feat = None
-                if args.pixel_drift_weight > 0:
-                    pixel_fake_feat = pixel_feature_extractor(fake)
-                    with torch.no_grad():
-                        pixel_real_feat = pixel_feature_extractor(real)
-
-                # For class-conditional training, compute drifting losses within each class.
                 if cond_num_classes > 0 and labels_t is not None:
                     loss = fake.new_zeros(())
-                    total_raw_drift_sq = 0.0
-                    total_norm_drift_sq = 0.0
-                    total_gap = 0.0
+                    total_raw = 0.0
+                    total_norm = 0.0
                     weight_sum = 0.0
 
                     for cls in labels_t.unique(sorted=False):
@@ -959,79 +718,25 @@ def train(args: argparse.Namespace) -> None:
                         cls_count = int(cls_mask.sum().item())
                         if cls_count < 2:
                             continue
-                        w = float(cls_count) / float(real.shape[0])
-                        cls_tag = int(cls.item())
 
+                        w = float(cls_count) / float(real.shape[0])
                         cls_fake_feats = [f[cls_mask] for f in fake_feats]
                         cls_real_feats = [f[cls_mask] for f in real_feats]
-                        cls_loss, cls_raw, cls_norm, cls_gap = compute_feature_set_loss(
-                            cls_fake_feats, cls_real_feats, prefix=f"feature/c{cls_tag}"
-                        )
-                        loss = loss + w * cls_loss
-                        total_raw_drift_sq += w * cls_raw
-                        total_norm_drift_sq += w * cls_norm
-                        total_gap += w * cls_gap
-                        weight_sum += w
+                        cls_loss, cls_raw, cls_norm = compute_feature_set_loss(cls_fake_feats, cls_real_feats)
 
-                        if args.pixel_drift_weight > 0:
-                            assert pixel_fake_feat is not None and pixel_real_feat is not None
-                            (
-                                pixel_loss_per_sample,
-                                pixel_raw_drift_sq,
-                                pixel_norm_drift_sq,
-                            ) = drifting_loss_from_features(
-                                pixel_fake_feat[cls_mask],
-                                pixel_real_feat[cls_mask],
-                                args.temperatures,
-                                norm_mode=args.drift_norm_mode,
-                                ema_state=drift_ema_state,
-                                ema_prefix=f"pixel/c{cls_tag}",
-                                ema_decay=args.drift_ema_decay,
-                                eps=args.eps,
-                            )
-                            loss = loss + args.pixel_drift_weight * w * pixel_loss_per_sample.mean()
-                            total_raw_drift_sq += args.pixel_drift_weight * w * pixel_raw_drift_sq
-                            total_norm_drift_sq += args.pixel_drift_weight * w * pixel_norm_drift_sq
-                            total_gap += args.pixel_drift_weight * w * feature_moment_gap(
-                                pixel_fake_feat[cls_mask].detach(),
-                                pixel_real_feat[cls_mask].detach(),
-                            )
+                        loss = loss + w * cls_loss
+                        total_raw += w * cls_raw
+                        total_norm += w * cls_norm
+                        weight_sum += w
 
                     if weight_sum > 0.0:
                         loss = loss / weight_sum
-                        total_raw_drift_sq /= weight_sum
-                        total_norm_drift_sq /= weight_sum
-                        total_gap /= weight_sum
+                        total_raw /= weight_sum
+                        total_norm /= weight_sum
                     else:
-                        loss, total_raw_drift_sq, total_norm_drift_sq, total_gap = (
-                            compute_feature_set_loss(fake_feats, real_feats, prefix="feature/global")
-                        )
+                        loss, total_raw, total_norm = compute_feature_set_loss(fake_feats, real_feats)
                 else:
-                    loss, total_raw_drift_sq, total_norm_drift_sq, total_gap = (
-                        compute_feature_set_loss(fake_feats, real_feats, prefix="feature/global")
-                    )
-                    if args.pixel_drift_weight > 0:
-                        assert pixel_fake_feat is not None and pixel_real_feat is not None
-                        (
-                            pixel_loss_per_sample,
-                            pixel_raw_drift_sq,
-                            pixel_norm_drift_sq,
-                        ) = drifting_loss_from_features(
-                            pixel_fake_feat,
-                            pixel_real_feat,
-                            args.temperatures,
-                            norm_mode=args.drift_norm_mode,
-                            ema_state=drift_ema_state,
-                            ema_prefix="pixel/global",
-                            ema_decay=args.drift_ema_decay,
-                            eps=args.eps,
-                        )
-                        loss = loss + args.pixel_drift_weight * pixel_loss_per_sample.mean()
-                        total_raw_drift_sq += args.pixel_drift_weight * pixel_raw_drift_sq
-                        total_norm_drift_sq += args.pixel_drift_weight * pixel_norm_drift_sq
-                        total_gap += args.pixel_drift_weight * feature_moment_gap(
-                            pixel_fake_feat.detach(), pixel_real_feat.detach()
-                        )
+                    loss, total_raw, total_norm = compute_feature_set_loss(fake_feats, real_feats)
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1042,31 +747,21 @@ def train(args: argparse.Namespace) -> None:
                 global_step += 1
                 seen += 1
                 running_loss += loss.item()
-                running_gap += total_gap
-                running_raw_drift += total_raw_drift_sq
-                running_norm_drift += total_norm_drift_sq
+                running_raw_drift += total_raw
+                running_norm_drift += total_norm
 
                 avg_loss = running_loss / seen
-                avg_gap = running_gap / seen
-                avg_raw_drift = running_raw_drift / seen
-                avg_norm_drift = running_norm_drift / seen
-                progress.update(
-                    task,
-                    advance=1,
-                    loss=avg_loss,
-                    gap=avg_gap,
-                    raw_drift=avg_raw_drift,
-                    norm_drift=avg_norm_drift,
-                )
+                avg_raw = running_raw_drift / seen
+                avg_norm = running_norm_drift / seen
+                progress.update(task, advance=1, loss=avg_loss, raw_drift=avg_raw, norm_drift=avg_norm)
 
                 if args.log_every > 0 and global_step % args.log_every == 0:
                     LOGGER.info(
-                        "step=%d loss=%.6f gap=%.6f raw_drift=%.6f norm_drift=%.6f",
+                        "step=%d loss=%.6f raw_drift=%.6f norm_drift=%.6f",
                         global_step,
                         avg_loss,
-                        avg_gap,
-                        avg_raw_drift,
-                        avg_norm_drift,
+                        avg_raw,
+                        avg_norm,
                     )
 
                 if args.sample_every > 0 and global_step % args.sample_every == 0:
@@ -1092,11 +787,10 @@ def train(args: argparse.Namespace) -> None:
 
             if seen > 0:
                 LOGGER.info(
-                    "epoch=%d/%d avg_loss=%.6f avg_gap=%.6f avg_raw_drift=%.6f avg_norm_drift=%.6f",
+                    "epoch=%d/%d avg_loss=%.6f avg_raw_drift=%.6f avg_norm_drift=%.6f",
                     epoch,
                     args.epochs,
                     running_loss / seen,
-                    running_gap / seen,
                     running_raw_drift / seen,
                     running_norm_drift / seen,
                 )
@@ -1123,13 +817,18 @@ def train(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Drifting image generator training script.")
+    parser = argparse.ArgumentParser(description="Drifting image generator training script (paper-core).")
 
     parser.add_argument("--dataset", choices=["fashionmnist", "imagenet"], default="fashionmnist")
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./outputs/drifting")
 
-    parser.add_argument("--image-size", type=int, default=0, help="0 means auto (32 for FashionMNIST, 64 for ImageNet).")
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=0,
+        help="0 means auto (32 for FashionMNIST, 64 for ImageNet).",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--steps-per-epoch", type=int, default=0, help="0 means full dataloader.")
@@ -1142,7 +841,7 @@ def parse_args() -> argparse.Namespace:
         "--feature-backbone",
         choices=["auto", "pyramid", "resnet18"],
         default="auto",
-        help="Feature extractor used to compute drift loss.",
+        help="Feature extractor used for drifting loss.",
     )
     parser.add_argument(
         "--pretrained-features",
@@ -1150,39 +849,15 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Use pretrained weights when available (for resnet18).",
     )
-    parser.add_argument("--temperatures", type=float, nargs="+", default=[0.05])
+
+    parser.add_argument("--temperatures", type=float, nargs="+", default=[0.02, 0.05, 0.2])
     parser.add_argument("--eps", type=float, default=1e-6)
-    parser.add_argument(
-        "--drift-norm-mode",
-        choices=["batch", "ema"],
-        default="ema",
-        help="How to normalize feature drift magnitudes.",
-    )
-    parser.add_argument(
-        "--drift-ema-decay",
-        type=float,
-        default=0.99,
-        help="EMA decay used when --drift-norm-mode=ema.",
-    )
-    parser.add_argument(
-        "--pixel-drift-weight",
-        type=float,
-        default=-1.0,
-        help="Weight for additional pixel-space drift loss. "
-        "If <0, auto-selects 0.5 for FashionMNIST and 0.0 for ImageNet.",
-    )
-    parser.add_argument(
-        "--pixel-drift-size",
-        type=int,
-        default=16,
-        help="Spatial size used for pixel-space drift features.",
-    )
 
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--grad-clip", type=float, default=2.0)
 
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--class-conditioning",
@@ -1213,10 +888,6 @@ def parse_args() -> argparse.Namespace:
         args.sample_seed = args.seed
     if args.class_conditioning is None:
         args.class_conditioning = args.dataset == "imagenet"
-    if not (0.0 < args.drift_ema_decay < 1.0):
-        raise ValueError("--drift-ema-decay must be in (0, 1).")
-    if args.pixel_drift_weight < 0:
-        args.pixel_drift_weight = 0.5 if args.dataset == "fashionmnist" else 0.1
     return args
 
 
