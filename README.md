@@ -4,7 +4,7 @@
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install torch torchvision rich
+uv pip install torch torchvision rich torchinfo
 ```
 
 ## 2) Quick test (FashionMNIST)

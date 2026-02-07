@@ -44,6 +44,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+import torchinfo
 from rich.table import Table
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
@@ -637,10 +638,12 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
     pixel_feature_extractor = PixelFeatureExtractor(size=args.pixel_drift_size).to(device)
 
+    console.print(torchinfo.summary(generator, verbose=0))
+
     optimizer = torch.optim.AdamW(
         generator.parameters(),
         lr=args.lr,
-        betas=(0.9, 0.95),
+        betas=(0.9, 0.9),
         weight_decay=args.weight_decay,
     )
     drift_ema_state: dict[str, float] = {}
