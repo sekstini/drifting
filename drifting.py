@@ -94,6 +94,7 @@ def compute_drift(
     y_pos: Tensor,
     y_neg: Tensor,
     temp: float = 0.05,
+    mask_self_negatives: bool = False,
     eps: float = 1e-12,
 ) -> Tensor:
     """
@@ -104,8 +105,12 @@ def compute_drift(
     dist_pos = torch.cdist(x, y_pos)
     dist_neg = torch.cdist(x, y_neg)
 
-    # Ignore self-interaction when negatives are the generated batch itself.
-    if x.shape == y_neg.shape and x.data_ptr() == y_neg.data_ptr():
+    # Paper Algorithm 2 masks self negatives when y_neg is the generated batch itself.
+    if mask_self_negatives:
+        if n != y_neg.shape[0]:
+            raise ValueError(
+                "mask_self_negatives=True requires x and y_neg to have same batch size."
+            )
         dist_neg = dist_neg + torch.eye(n, device=x.device, dtype=x.dtype) * 1e6
 
     logit = torch.cat([-dist_pos / temp, -dist_neg / temp], dim=1)
@@ -166,7 +171,13 @@ def compute_feature_drift(
     norm_vals: list[float] = []
     for tau in temperatures:
         tau_eff = max(float(tau), eps) * temp_scale
-        v = compute_drift(x_norm, pos_norm, neg_norm, temp=tau_eff)
+        v = compute_drift(
+            x_norm,
+            pos_norm,
+            neg_norm,
+            temp=tau_eff,
+            mask_self_negatives=True,
+        )
 
         with torch.no_grad():
             raw_sq = v.pow(2).sum(dim=-1).mean()
