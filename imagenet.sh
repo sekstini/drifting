@@ -1,11 +1,17 @@
 uv run python drifting.py \
     --dataset imagenet \
     --data-root ./data/imagenette2-160 \
-    --output-dir ./outputs/drifting_imagenette64_core \
-    --image-size 64 \
+    --output-dir ./outputs/drifting_imagenette_dit \
+    --generator-arch dit \
+    --image-size 128 \
     --batch-size 32 \
-    --latent-dim 256 \
-    --base-channels 96 \
+    --latent-dim 512 \
+    --dit-patch-size 8 \
+    --dit-hidden-dim 1024 \
+    --dit-depth 16 \
+    --dit-heads 16 \
+    --dit-mlp-ratio 4.0 \
+    --cond-drop-prob 0.1 \
     --lr 2e-4 \
     --weight-decay 0.01 \
     --class-conditioning \

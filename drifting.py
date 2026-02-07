@@ -214,6 +214,221 @@ def as_feature_list(feats: Tensor | Sequence[Tensor]) -> list[Tensor]:
     return list(feats)
 
 
+def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+
+def _sincos_1d(embed_dim: int, pos: Tensor) -> Tensor:
+    if embed_dim % 2 != 0:
+        raise ValueError("embed_dim for 1D sin-cos must be even.")
+    omega = torch.arange(embed_dim // 2, device=pos.device, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / float(embed_dim // 2)))
+    out = pos.float()[:, None] * omega[None, :]
+    return torch.cat([out.sin(), out.cos()], dim=1)
+
+
+def build_2d_sincos_pos_embed(embed_dim: int, grid_h: int, grid_w: int) -> Tensor:
+    if embed_dim % 4 != 0:
+        raise ValueError("embed_dim must be divisible by 4 for 2D sin-cos embedding.")
+    yy, xx = torch.meshgrid(
+        torch.arange(grid_h, dtype=torch.float32),
+        torch.arange(grid_w, dtype=torch.float32),
+        indexing="ij",
+    )
+    pos_y = _sincos_1d(embed_dim // 2, yy.reshape(-1))
+    pos_x = _sincos_1d(embed_dim // 2, xx.reshape(-1))
+    pos = torch.cat([pos_y, pos_x], dim=1)
+    return pos[None, :, :]
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, n, c = x.shape
+        qkv = self.qkv(x).view(b, n, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(b, n, c)
+        return self.proj(out)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, hidden_dim: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        inner = int(hidden_dim * mlp_ratio)
+        self.fc1 = nn.Linear(hidden_dim, inner)
+        self.act = nn.GELU(approximate="tanh")
+        self.fc2 = nn.Linear(inner, hidden_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.attn = SelfAttention(hidden_dim, num_heads)
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.ffn = FeedForward(hidden_dim, mlp_ratio=mlp_ratio)
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+
+        nn.init.zeros_(self.ada[-1].weight)
+        nn.init.zeros_(self.ada[-1].bias)
+
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+        shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = self.ada(c).chunk(
+            6, dim=1
+        )
+        x = x + gate_attn[:, None, :] * self.attn(_modulate(self.norm1(x), shift_attn, scale_attn))
+        x = x + gate_ffn[:, None, :] * self.ffn(_modulate(self.norm2(x), shift_ffn, scale_ffn))
+        return x
+
+
+class DiTFinalLayer(nn.Module):
+    def __init__(self, hidden_dim: int, patch_size: int, out_channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 2))
+        self.to_patch = nn.Linear(hidden_dim, patch_size * patch_size * out_channels)
+
+        nn.init.zeros_(self.ada[-1].weight)
+        nn.init.zeros_(self.ada[-1].bias)
+        nn.init.zeros_(self.to_patch.weight)
+        nn.init.zeros_(self.to_patch.bias)
+
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+        shift, scale = self.ada(c).chunk(2, dim=1)
+        x = _modulate(self.norm(x), shift, scale)
+        return self.to_patch(x)
+
+
+class DiTGenerator(nn.Module):
+    """
+    DiT-style generator with adaLN-zero conditioning.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        out_channels: int,
+        image_size: int,
+        num_classes: int = 0,
+        patch_size: int = 4,
+        hidden_dim: int = 768,
+        depth: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        if image_size % patch_size != 0:
+            raise ValueError("image_size must be divisible by patch_size.")
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+
+        self.latent_dim = latent_dim
+        self.out_channels = out_channels
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.grid_size = image_size // patch_size
+        self.num_patches = self.grid_size * self.grid_size
+        self.hidden_dim = hidden_dim
+        self.num_classes = max(0, int(num_classes))
+
+        self.noise_proj = nn.Linear(latent_dim, out_channels * image_size * image_size)
+        self.patch_embed = nn.Conv2d(
+            out_channels,
+            hidden_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        pos = build_2d_sincos_pos_embed(hidden_dim, self.grid_size, self.grid_size)
+        self.register_buffer("pos_embed", pos, persistent=False)
+
+        if self.num_classes > 0:
+            self.null_label = self.num_classes
+            self.class_embed = nn.Embedding(self.num_classes + 1, hidden_dim)
+        else:
+            self.null_label = -1
+            self.class_embed = None
+        self.uncond_embed = nn.Parameter(torch.zeros(1, hidden_dim))
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+        self.blocks = nn.ModuleList(
+            [DiTBlock(hidden_dim, num_heads=num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
+        )
+        self.final = DiTFinalLayer(hidden_dim, patch_size=patch_size, out_channels=out_channels)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        if isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _get_condition(self, labels: Tensor | None, batch: int, cond_drop_prob: float) -> Tensor:
+        if self.class_embed is None:
+            cond = self.uncond_embed.expand(batch, -1)
+            return self.cond_mlp(cond)
+
+        if labels is None:
+            raise ValueError("labels are required when class conditioning is enabled.")
+        if labels.shape[0] != batch:
+            raise ValueError("labels batch size mismatch.")
+
+        y = labels
+        if self.training and cond_drop_prob > 0:
+            keep = torch.rand(batch, device=labels.device) >= cond_drop_prob
+            nulls = torch.full_like(labels, self.null_label)
+            y = torch.where(keep, labels, nulls)
+        cond = self.class_embed(y)
+        return self.cond_mlp(cond)
+
+    def _unpatchify(self, x: Tensor) -> Tensor:
+        b, n, d = x.shape
+        g = self.grid_size
+        p = self.patch_size
+        c = self.out_channels
+        if n != g * g:
+            raise RuntimeError("Unexpected token count in unpatchify.")
+        x = x.view(b, g, g, p, p, c)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        return x.view(b, c, g * p, g * p)
+
+    def forward(self, z: Tensor, labels: Tensor | None = None, cond_drop_prob: float = 0.0) -> Tensor:
+        b = z.shape[0]
+        eps_img = self.noise_proj(z).view(b, self.out_channels, self.image_size, self.image_size)
+        x = self.patch_embed(eps_img).flatten(2).transpose(1, 2)
+        x = x + self.pos_embed.to(device=x.device, dtype=x.dtype)
+        c = self._get_condition(labels=labels, batch=b, cond_drop_prob=cond_drop_prob)
+        for block in self.blocks:
+            x = block(x, c)
+        x = self.final(x, c)
+        x = self._unpatchify(x)
+        return torch.tanh(x)
+
+    @torch.no_grad()
+    def generate(self, n: int, device: torch.device, labels: Tensor | None = None) -> Tensor:
+        z = torch.randn(n, self.latent_dim, device=device)
+        return self(z, labels=labels, cond_drop_prob=0.0)
+
+
 class ConvGenerator(nn.Module):
     """
     Simple upsampling conv generator (kept intentionally minimal).
@@ -276,7 +491,8 @@ class ConvGenerator(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def forward(self, z: Tensor, labels: Tensor | None = None) -> Tensor:
+    def forward(self, z: Tensor, labels: Tensor | None = None, cond_drop_prob: float = 0.0) -> Tensor:
+        del cond_drop_prob
         if self.class_embed is not None:
             if labels is None:
                 raise ValueError("labels are required when class conditioning is enabled.")
@@ -386,6 +602,42 @@ def build_feature_extractor(name: str, dataset_name: str, use_pretrained: bool) 
     raise ValueError(f"Unsupported feature extractor: {name}")
 
 
+def build_generator(
+    arch: str,
+    latent_dim: int,
+    out_channels: int,
+    image_size: int,
+    base_channels: int,
+    num_classes: int,
+    patch_size: int,
+    hidden_dim: int,
+    depth: int,
+    num_heads: int,
+    mlp_ratio: float,
+) -> nn.Module:
+    if arch == "conv":
+        return ConvGenerator(
+            latent_dim=latent_dim,
+            out_channels=out_channels,
+            image_size=image_size,
+            base_channels=base_channels,
+            num_classes=num_classes,
+        )
+    if arch == "dit":
+        return DiTGenerator(
+            latent_dim=latent_dim,
+            out_channels=out_channels,
+            image_size=image_size,
+            num_classes=num_classes,
+            patch_size=patch_size,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+        )
+    raise ValueError(f"Unsupported generator architecture: {arch}")
+
+
 def image_transform(dataset_name: str, image_size: int) -> transforms.Compose:
     if dataset_name == "fashionmnist":
         return transforms.Compose(
@@ -473,7 +725,7 @@ def unpack_batch(batch: object) -> tuple[Tensor, Tensor | None]:
 
 @torch.no_grad()
 def save_samples(
-    generator: ConvGenerator,
+    generator: nn.Module,
     out_path: Path,
     n_samples: int,
     nrow: int,
@@ -488,7 +740,7 @@ def save_samples(
     labels = None
     if fixed_labels is not None:
         labels = fixed_labels[: z.shape[0]].to(device)
-    images = generator(z, labels=labels).cpu()
+    images = generator(z, labels=labels, cond_drop_prob=0.0).cpu()
     grid = make_grid(images, nrow=nrow, normalize=True, value_range=(-1, 1))
     save_image(grid, str(out_path))
     if was_training:
@@ -496,7 +748,7 @@ def save_samples(
 
 
 def save_checkpoint(
-    generator: ConvGenerator,
+    generator: nn.Module,
     optimizer: torch.optim.Optimizer,
     out_path: Path,
     args: argparse.Namespace,
@@ -536,6 +788,16 @@ def render_config_table(
     table.add_row("steps_per_epoch", str(args.steps_per_epoch if args.steps_per_epoch > 0 else "full"))
     table.add_row("max_steps", str(args.max_steps if args.max_steps > 0 else "none"))
     table.add_row("latent_dim", str(args.latent_dim))
+    table.add_row("generator_arch", args.generator_arch)
+    if args.generator_arch == "conv":
+        table.add_row("base_channels", str(args.base_channels))
+    else:
+        table.add_row("dit_patch_size", str(args.dit_patch_size))
+        table.add_row("dit_hidden_dim", str(args.dit_hidden_dim))
+        table.add_row("dit_depth", str(args.dit_depth))
+        table.add_row("dit_heads", str(args.dit_heads))
+        table.add_row("dit_mlp_ratio", f"{args.dit_mlp_ratio:g}")
+        table.add_row("cond_drop_prob", f"{args.cond_drop_prob:g}")
     table.add_row("feature_extractor", feature_name)
     table.add_row("temperatures", ",".join(f"{t:g}" for t in args.temperatures))
     table.add_row("optimizer", "AdamW(beta1=0.9,beta2=0.95)")
@@ -573,16 +835,34 @@ def train(args: argparse.Namespace) -> None:
     for p in feature_extractor.parameters():
         p.requires_grad_(False)
 
-    generator = ConvGenerator(
+    generator = build_generator(
+        arch=args.generator_arch,
         latent_dim=args.latent_dim,
         out_channels=out_channels,
         image_size=args.image_size,
         base_channels=args.base_channels,
         num_classes=cond_num_classes,
+        patch_size=args.dit_patch_size,
+        hidden_dim=args.dit_hidden_dim,
+        depth=args.dit_depth,
+        num_heads=args.dit_heads,
+        mlp_ratio=args.dit_mlp_ratio,
     ).to(device)
 
     if torchinfo is not None:
-        console.print(torchinfo.summary(generator, verbose=0))
+        try:
+            console.print(
+                torchinfo.summary(
+                    generator,
+                    input_size=(1, args.latent_dim),
+                    device=str(device),
+                    verbose=0,
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning("Could not render model summary: %s", exc)
+        # Some torchinfo paths can leave modules on CPU; force device consistency.
+        generator = generator.to(device)
 
     optimizer = torch.optim.AdamW(
         generator.parameters(),
@@ -701,7 +981,11 @@ def train(args: argparse.Namespace) -> None:
                     labels_t = labels.to(device, dtype=torch.long, non_blocking=(device.type == "cuda"))
 
                 z = torch.randn(real.shape[0], args.latent_dim, device=device)
-                fake = generator(z, labels=labels_t)
+                fake = generator(
+                    z,
+                    labels=labels_t,
+                    cond_drop_prob=(args.cond_drop_prob if cond_num_classes > 0 else 0.0),
+                )
 
                 fake_feats = as_feature_list(feature_extractor(fake))
                 with torch.no_grad():
@@ -836,6 +1120,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=64)
+    parser.add_argument(
+        "--generator-arch",
+        choices=["conv", "dit"],
+        default="dit",
+        help="Generator backbone. 'dit' is a DiT-style transformer with adaLN-zero conditioning.",
+    )
+    parser.add_argument("--dit-patch-size", type=int, default=4)
+    parser.add_argument("--dit-hidden-dim", type=int, default=768)
+    parser.add_argument("--dit-depth", type=int, default=12)
+    parser.add_argument("--dit-heads", type=int, default=12)
+    parser.add_argument("--dit-mlp-ratio", type=float, default=4.0)
 
     parser.add_argument(
         "--feature-backbone",
@@ -866,6 +1161,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable label-conditioned generation when labels are available.",
     )
     parser.add_argument(
+        "--cond-drop-prob",
+        type=float,
+        default=0.1,
+        help="Classifier-free conditioning dropout probability (used when class conditioning is enabled).",
+    )
+    parser.add_argument(
         "--sample-seed",
         type=int,
         default=None,
@@ -888,6 +1189,8 @@ def parse_args() -> argparse.Namespace:
         args.sample_seed = args.seed
     if args.class_conditioning is None:
         args.class_conditioning = args.dataset == "imagenet"
+    if not (0.0 <= args.cond_drop_prob < 1.0):
+        raise ValueError("--cond-drop-prob must be in [0, 1).")
     return args
 
 
